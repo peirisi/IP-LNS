@@ -119,8 +119,8 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--instances', type=str, default='8_std')#set to 8 for quick start
-    parser.add_argument('--core_num', type=str, default='1')
-    parser.add_argument('--mip_num', type=str, default='1')#set to 1 for quick start, 10 or more for full dataset
+    parser.add_argument('--core_num', type=int, default='1')
+    parser.add_argument('--mip_num', type=int, default='1')#set to 1 for quick start, 10 or more for full dataset
 
     args = parser.parse_args()
 
