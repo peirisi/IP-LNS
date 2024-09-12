@@ -1,7 +1,5 @@
 *.pt
 *.lp
-*.pth
 *.mod
 *.pkl
 *.npy
-*.json

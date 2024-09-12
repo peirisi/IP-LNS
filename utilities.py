@@ -4,7 +4,57 @@ from gurobipy import GRB
 from torch_geometric.data import HeteroData
 import collections
 import gurobipy as gp
+import time
 
+def cmp_sol(model, where):
+    if where == gp.GRB.Callback.MIPSOL:
+        t = time.time() - model._start_time        
+        obj = model.cbGet(gp.GRB.Callback.MIPSOL_OBJ)
+        if len(model._objs)==0 or obj<model._objs[-1]:
+            model._objs.append(obj)
+            model._times.append(t)
+            sol = np.round(model.cbGetSolution(model._u))
+            model._sols.append(sol.copy())
+
+def local_search(m,sol,relaxed,begin,TLE=10,out=True):
+    m1 = m.copy()
+    m1.setParam('TimeLimit', TLE)
+    # m1.setParam('OutputFlag', out)
+    m1.setParam('Threads', 1)
+    # m1.setParam('MIPGap', 1e-5)
+    u = m1.getVars()[:len(sol)]
+    for i in range(len(sol)):
+        if relaxed[i] == 0:
+            m1.addConstr(u[i]==sol[i],name=f'fix_u[{i}]')
+        else:
+            u[i].setAttr('Start', sol[i])
+    m1._start_time=begin
+    m1._objs=[]
+    m1._times=[]
+    m1._sols = []
+    m1._u=u
+    # m1.optimize()
+    if out:
+        m1.optimize(cmp_sol)
+    else:
+        m1.optimize()
+    if m1.status == 3:
+        return -1,-1,-1
+    sol = np.round(np.array(m1.getAttr('X', u)))
+    return sol,m1._objs,m1._times
+
+def solve(m,sol):
+    sol=sol.reshape(-1)
+    m1 = m.copy()
+    u = m1.getVars()[:len(sol)]
+    for i in range(len(sol)):
+        m1.addConstr(u[i]==sol[i],name=f'fix_u[{i}]')
+    m1.optimize()
+    if m1.status==2 or m1.status==9:
+        return m1.objVal
+    else:
+        print(m1.status)
+    return 1e19+7
 
 def get_norm(ori_tensor):
     ori_tensor = ori_tensor.reshape(-1,1)
@@ -353,7 +403,7 @@ def restore_on_off(ans,ans_o,on_off,on,off):
                     if idx>=T or ans[i,idx]==1:
                         break
                     ans[i,idx]=1
-                    ans_o[i,idx]=ans_o[i,t]#**********************关键一步，将被动开机变量与主动开机变量关联，方便邻域搜索。这些开机的变量都是因为ans_o[i,t]而开机，所以邻域中需要一起松弛。
+                    ans_o[i,idx]=ans_o[i,t]
             t+=l
             while t<T and ans[i,t]!=1:
                 t+=1
@@ -378,29 +428,23 @@ def restore_on_off(ans,ans_o,on_off,on,off):
                 t+=1
     return ans
 
-def restore_shutdown(ans,m):
+
+def early_startup(ans,sol_o,res,t,l2r,su):
     N=ans.shape[0]
     T=ans.shape[1]
-    r=m.relax()
-    for i in range(N):
-        for t in range(T):
-            r.addConstr(m.getVarByName(f'u[{i},{t}]')==ans[i,t])
-    r.optimize()
-
-def early_startup(ans,res,t,l2r,su):
-    N=ans.shape[0]
     sum=0
     for i in range(N):
         if l2r[i,t]<0:
             res-=su[i]
             sum+=su[i]
             ans[i,t]=1
+            if t+1<T:
+                sol_o[i,t]=sol_o[i,t+1]
         if res<=0:
             break
     return ans,sum
 
-
-def delay_shutdown(ans,res,t,r2l,sd):
+def delay_shutdown(ans,sol_o,res,t,r2l,sd):
     N=ans.shape[0]
     sum=0
     for i in range(N):
@@ -408,15 +452,17 @@ def delay_shutdown(ans,res,t,r2l,sd):
             res-=sd[i]
             sum+=sd[i]
             ans[i,t]=1
+            if t-1>=0:
+                sol_o[i,t]=sol_o[i,t-1]
         if res<=0:
             break
     return ans,sum
 
-def com_cont_on_off(ans,on_off,off):
+def com_cont_on_off(ans,ans_o,on_off,off):
     N=ans.shape[0]
     T=ans.shape[1]
-    r2l_off = np.zeros_like(ans)# Indicates how many more periods need to be shut down, values below 0 indicate that it can be turned on
-    l2r_off = np.zeros_like(ans)# Indicates how many more periods need to be shut down, values below 0 indicate that it can be turned on
+    r2l_off = np.zeros_like(ans)
+    l2r_off = np.zeros_like(ans)
     for i in range(N):
         if on_off[i]<0:
             l2r_off[i,0]=off[i]+on_off[i]-1
@@ -431,7 +477,7 @@ def com_cont_on_off(ans,on_off,off):
         if ans[i,T-1]<1:
             r2l_off[i,T-1]=-1
         for t in range(T-2,-1,-1):
-            if ans[i,t+1]<1 and ans[i,t]<1:
+            if ans[i,t+1]<1 and ans[i,t]<1 and ans_o[i,t]>=0:
                 r2l_off[i,t]=r2l_off[i,t+1]-1
             elif ans[i,t+1]==1 and ans[i,t]<1:
                 r2l_off[i,t]=off[i]-1
@@ -507,7 +553,33 @@ def restore_ramp(u_close,sol_o,Dt,Ui0,Pi0,Pidown,Piup,ThPimin,ThPimax,Pistartup,
             print('fail meet ramp constraint')
     return u_close
 
-def restore(sol_o, uc, data):
+def feasibility_pump(mo,sol):
+    ans = sol.copy()
+    ans = ans.reshape(-1)
+    m=mo.copy()
+    v = m.getVars()[:len(ans)]
+    ans = np.round(ans)
+    alpha = []
+    for i in range(len(ans)):
+        if ans[i]==0 or ans[i]==1:
+            v[i].setAttr('Start', ans[i])
+            tmp_var = m.addVar(vtype=GRB.CONTINUOUS,name=f'alpha{v[i].VarName}')
+            alpha.append(tmp_var) 
+            m.addConstr(tmp_var >= v[i] - ans[i], name=f'alpha_up_{v[i].VarName}')
+            m.addConstr(tmp_var >= ans[i] - v[i], name=f'alpha_dowm_{v[i].VarName}')
+            # m.addConstr(instance_variabels[i] == ans[i], name=f'alpha_{instance_variabels[i].VarName}')
+    m.setObjective(sum(alpha), GRB.MINIMIZE)
+    m.setParam('MIPFocus', 1)
+    m.setParam('SolutionLimit', 1)
+    # m.setParam('TimeLimit', 1000)
+    m.update()
+    m.optimize()
+    if m.status==3 or m.status==4:
+        return None
+    return np.round(np.array(m.getAttr('X', v))).reshape(-1).astype(int)
+
+
+def restore(sol_o, uc, data, m3):
     sol = sol_o.copy().reshape(-1,24)
     Dt = data['Dt']
     Spin = data['Spin']
@@ -530,7 +602,11 @@ def restore(sol_o, uc, data):
     sol_s = restore_on_off(sol_s,sol,on_off,on,off)
     sol_s = restore_ramp(sol_s,sol,Dt,u0,p0,ramp_down,ramp_up,pmin,pmax,startup,shut_down,on_off,off)
     sol_s = restore_on_off(sol_s,sol,on_off,on,off)
-    return sol.reshape(-1), sol_s.reshape(-1).astype(int)
+    last = solve(m3,sol_s)
+    if last>1e19:
+        sol_s = feasibility_pump(m3,sol_o)
+        last = solve(m3,sol_s)
+    return sol.reshape(-1), sol_s.reshape(-1).astype(int), last
 
 
 
@@ -571,3 +647,84 @@ def train_cl(predict, data_loader, DEVICE, optimizer=None):
             n_samples_processed += 1
     mean_loss /= n_samples_processed
     return mean_loss
+
+def get_edge(sol,on):
+    sol = sol.reshape(-1,24)
+    N = sol.shape[0]
+    T = sol.shape[1]
+    edge = np.zeros_like(sol)
+    for i in range(N):
+        for j in range(T-1):
+            if sol[i][j]!=sol[i][j+1]:
+                shift = on[i]//2
+                length = on[i]//2
+                start = max(0,j-shift)
+                end = min(T,j+length)
+                edge[i][start:end]=1
+    return edge.reshape(-1)
+
+def local_descend(global_descend, local, old_sol, new_sol):
+    last_round_descend = np.ones_like(local).astype(float)
+    indices = np.where(local == 1)[0]
+    selected_indices = np.random.choice(indices, size=int(len(indices) * 1), replace=False)
+    global_descend[selected_indices] *= 0.9
+    last_round_descend[selected_indices] *= 0.5
+    indices = np.where(old_sol != new_sol)[0]
+    selected_indices = np.random.choice(indices, size=int(len(indices) * 1), replace=False)
+    global_descend[selected_indices] *= 0.8
+    last_round_descend[selected_indices] *= 0.01
+    last_round_descend*=global_descend
+    return global_descend,last_round_descend
+
+
+
+def local_search_repeat(m, search_model, sol, begin, on, opt=0,out=10,TLE=600,search_time=30,log=False,no_gain_exit=False):
+    
+    percentage=80
+    last_round_descend = np.ones_like(sol).astype(float)
+    global_descend = np.ones_like(sol).astype(float)
+    cur_time = time.time()
+    time_left = TLE-(cur_time-begin)
+    time_round=[]
+    obj_round=[]
+    last=np.inf
+    for cnt in range(out):
+        if time_left<=1:
+            break
+        st = time.time()
+        Tri_graph = get_Tripartite_graph_lp_with_sol(m,sol)
+        t1 = time.time()
+        structTime = t1-st
+        begin+=structTime
+        neighbor = search_model(Tri_graph).detach().cpu().numpy().reshape(-1)
+        neighbor *= last_round_descend
+        threshold_num = np.percentile(neighbor, percentage)
+        local = np.zeros_like(neighbor,dtype=int)
+        res = int((1-percentage/100)*len(neighbor))
+        for i in range(len(neighbor)):
+            if neighbor[i]>=threshold_num and res>0:
+                local[i]=1
+                res-=1
+        
+        edge = get_edge(sol,on)
+        indices = np.where(edge == 1)
+        local[indices] = 1
+        new_sol,new_objs,new_times = local_search(m, sol, local, begin, TLE=min(search_time,max(5,time_left)))
+        new = new_objs[-1]
+        cur_time = time.time()
+        global_descend,last_round_descend = local_descend(global_descend, local, sol, new_sol)
+        sol = new_sol
+        time_round.extend(new_times)
+        obj_round.extend(new_objs)
+        time_left = max(0,TLE-(cur_time-begin))
+        if no_gain_exit and (last-new)/last<=1e-6:
+            break
+        if (last-new)/last<=1e-6:
+            percentage*=0.9
+            percentage=max(percentage,70)
+        else:
+            percentage*=1.1
+            percentage=min(percentage,90)
+
+        last=new
+    return new,cnt,time_round,obj_round,sol
